@@ -1,15 +1,14 @@
-import { Reporter, Suite, FullConfig, TestCase, TestResult } from '@playwright/test/reporter';
+import { Reporter, TestCase, TestResult } from '@playwright/test/reporter';
 
+/**
+ * TestRailReporter is a Playwright test reporter that uploads test results to TestRail.
+ * It requires
+ */
 declare class TestRailReporter implements Reporter {
-    suite: Suite | undefined;
-    private functionQue;
-    private testRailPluginPromise;
-    private testRailPlugin;
-    private testCases;
-    onBegin(config: FullConfig, suite: Suite): Promise<void>;
+    private results;
+    private caseIDs;
     onTestEnd(test: TestCase, result: TestResult): Promise<void>;
     onEnd(): Promise<void>;
-    onExit(): Promise<void>;
 }
 
 export { TestRailReporter as default };

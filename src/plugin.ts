@@ -1,16 +1,13 @@
-import TestRail, {
-  AddResultForCase,
-  AddResultsForCases,
-} from '@dlenroc/testrail';
+import TestRail, {AddResultForCase} from '@dlenroc/testrail';
+import fs, {ReadStream} from 'fs';
 import {TestCase, TestResult} from '@playwright/test/reporter';
 import {testrailBuilder} from './builder';
-import {retryCallback} from './util/retry';
+import ProcessEnvFacade from './util/ProcessEnvFacade';
 
 export class TestRailPlugin {
   private client: TestRail;
   private runInstance: TestRail.Run;
   private allCases: number[] = [];
-  private results: AddResultsForCases = {results: []};
 
   private constructor(
     client: TestRail,
@@ -24,13 +21,30 @@ export class TestRailPlugin {
 
   static async create() {
     const builder = testrailBuilder();
-    const client = await builder.initializeClient();
+    const client = builder.initializeClient();
     const runInstance = await builder.initializeRun(client);
     const cases = (await this.getAllCasesInRun(client, runInstance.id)) ?? [];
     return new TestRailPlugin(client, runInstance, cases);
   }
 
   //region run
+
+  static getAllCaseIdsFromAnnotations(
+    annotations: Array<{type: string; description?: string}>
+  ) {
+    // TestRail annotations will have type: 'test_id' and the ID in the description
+    const idArr: number[] = [];
+    annotations.forEach(annotation => {
+      if (annotation.type === 'test_id') {
+        // TestRail case IDs are prefixed with 'C', so we need to remove it
+        const caseId = Number(annotation.description?.substring(1));
+        if (!isNaN(caseId)) {
+          idArr.push(caseId);
+        }
+      }
+    });
+    return idArr;
+  }
 
   private static async getAllCasesInRun(
     client: TestRail,
@@ -39,6 +53,8 @@ export class TestRailPlugin {
     const tests = await client.getTests(runId);
     return tests.map(result => result.case_id) ?? [];
   }
+
+  //endregion
 
   /**
    * Adds the provided case ids to the run, and removes any invalid case ids
@@ -65,95 +81,86 @@ export class TestRailPlugin {
     }
   }
 
-  //endregion
-
   async closeRun(runId: number) {
     return await this.client.closeRun(runId);
   }
 
   //region results
+  async uploadAllResults(results: TestCaseResult[]) {
+    /*
+    case_id?: number;
+    status_id?: number;
+    comment?: string;
+    version?: string;
+    elapsed?: string;
+    defects?: string;
+    assignedto_id?: number;
+     */
+    const payload: AddResultForCase[] = [];
+    const attachmentIds: number[] = [];
+    for (const result of results) {
+      // keep a list of tests to attempt attachment upload
+      const shouldUploadAttachments = result.testResult.status !== 'passed';
+      const ids = TestRailPlugin.getAllCaseIdsFromAnnotations(
+        result.testCase.annotations
+      );
+      if (shouldUploadAttachments) {
+        attachmentIds.push(...ids);
+      }
+      for (const parseResult of this.parseResults(ids, result)) {
+        payload.push(parseResult);
+      }
+    }
 
-  async processResults(testCase: TestCaseResult) {
-    const title = testCase.testCase.title;
-    const ids = this.getAllCaseIdsFromTitle(title);
-    const results = this.parseResults(ids, testCase);
-    if (results.results) {
-      this.results.results?.push(...results.results);
+    const addResultRes = await this.client.addResultsForCases(
+      this.runInstance.id,
+      {
+        results: payload,
+      }
+    );
+
+    if (addResultRes) {
+      for (const attachmentId of attachmentIds) {
+        const attachment = results.find(result =>
+          TestRailPlugin.getAllCaseIdsFromAnnotations(
+            result.testCase.annotations
+          ).includes(attachmentId)
+        )?.testResult.attachments;
+        if (attachment) {
+          await Promise.all(
+            attachment.map(async attach => {
+              const fileStream = await this.getFileStream(attach);
+              if (!fileStream) return;
+              await this.tryUploadAttachment(
+                addResultRes.find(res => res.case_id === attachmentId)!,
+                fileStream
+              );
+            })
+          );
+        }
+      }
     }
   }
 
   async teardown() {
-    await this.addResults(this.results);
-    if (process.env.CI === 'true') {
+    if (ProcessEnvFacade.getValue('CI') === 'true') {
       await this.closeRun(this.runInstance.id);
     }
     console.log(`All tests complete. Run: ${this.runInstance.url} updated.`);
   }
 
-  getAllCaseIdsFromTitle(title: string) {
-    const idArr = [];
-    const caseIDRegex = /C(\d+)/g;
-    const caseIds = title
-      .match(caseIDRegex)
-      ?.map(str => Number(str.substring(1)));
-    if (caseIds) {
-      idArr.push(...caseIds);
-    }
-    return idArr;
-  }
-
-  async logTestedCases() {
-    const cases: (number | undefined)[] = [];
-    this.results.results?.forEach(result => {
-      cases.push(result.case_id);
-    });
-    console.log(cases);
-  }
-
   //endregion
-
-  private async addResults(
-    results: AddResultsForCases
-  ): Promise<TestRail.Result[] | undefined> {
-    try {
-      return await retryCallback(
-        async () => {
-          try {
-            return await this.client.addResultsForCases(
-              this.runInstance.id,
-              results
-            );
-          } catch (error) {
-            return undefined;
-          }
-        },
-        5000,
-        {delay: 1000}
-      );
-    } catch (error) {
-      throw new Error(`TestRail addResultsForCases failed: ${error}`);
-    }
-  }
 
   private parseResults(
     ids: number[],
     testCaseResult: TestCaseResult
-  ): AddResultsForCases {
-    return {
-      results: ids.map(thisCaseId => {
-        return this.generateResult(testCaseResult, thisCaseId);
-      }),
-    };
+  ): AddResultForCase[] {
+    return ids.map(thisCaseId => {
+      return this.generateResult(thisCaseId, testCaseResult);
+    });
   }
 
-  //endregion
-
-  //region util
-
-  private generateResult(
-    testCaseResult: TestCaseResult,
-    thisCaseId: number
-  ): AddResultForCase {
+  private generateResult(thisCaseId: number, testCaseResult: TestCaseResult) {
     const errors = testCaseResult.testResult.errors;
     const errorStr = this.removeAnsiCodes(JSON.stringify(errors));
     return {
@@ -164,8 +171,46 @@ export class TestRailPlugin {
   }
 
   //region attachments
+  private async getFileStream(attachment: Attachment) {
+    const path = attachment.path;
+    if (path && fs.existsSync(path)) {
+      return fs.createReadStream(path);
+    } else {
+      console.error(
+        `Attachment at ${path ?? '_path missing_'} does not exist.`
+      );
+      return undefined;
+    }
+  }
+
+  private async tryUploadAttachment(
+    result: TestRail.Result,
+    fileStream: ReadStream
+  ) {
+    let attemptsLeft = 2;
+    let done = false;
+    do {
+      try {
+        await this.client.addAttachmentToResult(result.id, fileStream);
+        done = true;
+      } catch (e) {
+        attemptsLeft--;
+        if (attemptsLeft <= 0) {
+          console.error(
+            `Failed to upload attachment ${fileStream.path} to TestRail.\nCase: ${result.location}`,
+            e
+          );
+        } else {
+          console.warn(
+            `Failed to upload attachment ${fileStream.path} to TestRail. Retrying...`
+          );
+        }
+      }
+    } while (!done && attemptsLeft > 0);
+  }
 
   private generateComment(test: TestCaseResult, errorStr: string) {
+    const currentEnv = test.testCase.titlePath()[1]; //0th element in the title is the env context
     const errorMessage =
       `Errors----\n ${errorStr.replace(/\\n/g, '\n')}\n` +
       `stderr----\n ${test.testResult.stderr}\n` +
@@ -178,8 +223,7 @@ export class TestRailPlugin {
     } else {
       outcomeMessage = passedMessage;
     }
-    // return `Env: ${currentEnv}\n${outcomeMessage}`;
-    return outcomeMessage;
+    return `Env: ${currentEnv}\n${outcomeMessage}`;
   }
 
   private removeAnsiCodes(str: string) {
@@ -276,8 +320,6 @@ export class TestRailPlugin {
     }
     return resp;
   }
-
-  //endregion
 }
 
 //region interfaces
@@ -294,4 +336,13 @@ type StatusName =
   | 'failed'
   | 'skipped';
 
+/**
+ * TestRail does not have their own alias for this
+ */
+type Attachment = {
+  name: string;
+  contentType: string;
+  path?: string;
+  body?: Buffer;
+};
 //endregion

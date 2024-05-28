@@ -26,18 +26,10 @@ Add **playwright-testrail** into **playwright.config.ts**:
 }
 ```
 
-Or pass the same value via config file:
-
-```js
-{
-  reporter: [["line"], ["playwright-testrail"]];
-}
-```
-
 Or pass the same value via command line:
 
 ```bash
-npx playwright test --reporter=line,playwright-testrail
+npx playwright test --reporter=playwright-testrail
 ```
 
 ---
